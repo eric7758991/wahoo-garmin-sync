@@ -430,6 +430,15 @@ def login_wahoo(session: requests.Session) -> bool:
 
     Wahoo 登录页是 Rails 应用，表单 POST 到 /saml/auth，
     包含 authenticity_token、SAMLRequest、email、password 字段。
+
+    登录流程：
+      1. GET 登录页，提取表单 hidden 字段（authenticity_token、SAMLRequest、RelayState）
+      2. POST 表单到表单 action URL（剥离 query 参数），附带 email/password
+      3. 检查响应：如果返回 200 且页面无登录表单/错误信息，则登录成功
+
+    常见失败原因：
+      - 服务器返回 404：Wahoo 可能在 GitHub Actions 的 Azure IP 段有反爬虫限制
+      - CSRF/SAML token 过期：需要先 GET 登录页获取新鲜 token
     """
     logger.info("正在访问 Wahoo 登录页...")
 
@@ -446,7 +455,21 @@ def login_wahoo(session: requests.Session) -> bool:
     # 从表单提取 hidden 字段
     form = soup.find("form", {"action": re.compile(r"/saml/auth")})
     if not form:
+        # 尝试更宽松的查找：任何包含 email/password input 的表单
+        form = soup.find("form")
+        if form:
+            has_email = form.find("input", {"name": "email"}) or form.find("input", {"type": "email"})
+            if not has_email:
+                form = None
+
+    if not form:
         logger.error("未找到登录表单，页面结构可能已变更")
+        # 保存调试页面
+        FIT_DIR.mkdir(parents=True, exist_ok=True)
+        debug_file = FIT_DIR / "debug_login_page.html"
+        with open(debug_file, "w", encoding="utf-8") as f:
+            f.write(resp.text)
+        logger.info("登录页源码已保存到 %s 供调试", debug_file)
         return False
 
     form_inputs = {}
@@ -456,15 +479,23 @@ def login_wahoo(session: requests.Session) -> bool:
         if name:
             form_inputs[name] = value
 
-    # 获取表单 action
-    action = form.get("action", "/saml/auth")
-    if action.startswith("/"):
-        post_url = f"{WAHOO_BASE_URL}{action}"
+    # 获取表单 action，剥离 query 参数（Rails 表单 action 不应含 query string）
+    raw_action = form.get("action", "/saml/auth")
+    # 去掉 ?xxx 部分，保留纯路径
+    action_path = raw_action.split("?")[0]
+    if action_path.startswith("/"):
+        post_url = f"{WAHOO_BASE_URL}{action_path}"
+    elif action_path.startswith("http"):
+        post_url = action_path
     else:
-        post_url = action
+        post_url = f"{WAHOO_BASE_URL}/{action_path}"
 
     logger.info("登录表单 POST 到: %s", post_url)
     logger.info("表单隐藏字段: %s", list(form_inputs.keys()))
+
+    # 如果有 CSRF token，也加入表单
+    if csrf_token and "authenticity_token" not in form_inputs:
+        form_inputs["authenticity_token"] = csrf_token
 
     # Step 2: POST 登录
     form_data = dict(form_inputs)
@@ -474,19 +505,46 @@ def login_wahoo(session: requests.Session) -> bool:
     headers = {
         "Referer": f"{WAHOO_BASE_URL}/login",
         "Origin": WAHOO_BASE_URL,
+        "Content-Type": "application/x-www-form-urlencoded",
     }
 
     logger.info("正在提交 Wahoo 登录凭证...")
-    resp = session.post(post_url, data=form_data, headers=headers, timeout=30, allow_redirects=True)
+    try:
+        resp = session.post(post_url, data=form_data, headers=headers, timeout=30, allow_redirects=True)
+    except requests.RequestException as e:
+        logger.error("Wahoo 登录请求异常: %s", e)
+        return False
 
-    # 检查是否登录成功
-    if resp.status_code == 200:
-        resp_lower = resp.text.lower()
-        if "invalid email or password" in resp_lower or "log in" in resp_lower and "password" in resp_lower:
-            if "invalid" in resp_lower:
-                logger.error("Wahoo 登录失败：邮箱或密码错误")
-                return False
-            logger.warning("登录后似乎仍在登录页，但未检测到明确错误，继续尝试...")
+    # 严格检查：非 200 状态码视为失败
+    if resp.status_code != 200:
+        logger.error("Wahoo 登录失败：HTTP %d（URL: %s）", resp.status_code, resp.url)
+        # 保存调试页面
+        FIT_DIR.mkdir(parents=True, exist_ok=True)
+        debug_file = FIT_DIR / "debug_login_response.html"
+        with open(debug_file, "w", encoding="utf-8") as f:
+            f.write(resp.text[:5000] if resp.text else "(empty response)")
+        logger.info("登录响应已保存到 %s 供调试（前 5000 字符）", debug_file)
+        return False
+
+    # 检查响应页面是否仍包含登录表单或错误信息
+    resp_lower = resp.text.lower()
+    if "invalid email or password" in resp_lower:
+        logger.error("Wahoo 登录失败：邮箱或密码错误")
+        return False
+
+    # 如果页面仍有登录表单（email + password input），说明未成功登录
+    soup_resp = BeautifulSoup(resp.text, "html.parser")
+    login_form = soup_resp.find("form", {"action": re.compile(r"/saml/auth")})
+    if login_form:
+        has_password = login_form.find("input", {"type": "password"}) or login_form.find("input", {"name": "password"})
+        if has_password:
+            logger.error("Wahoo 登录后仍在登录页，认证可能被拒绝")
+            FIT_DIR.mkdir(parents=True, exist_ok=True)
+            debug_file = FIT_DIR / "debug_login_still_on_login.html"
+            with open(debug_file, "w", encoding="utf-8") as f:
+                f.write(resp.text[:5000])
+            logger.info("响应页面已保存到 %s 供调试", debug_file)
+            return False
 
     logger.info("Wahoo 登录成功（HTTP %d，URL: %s）", resp.status_code, resp.url)
     return True
@@ -496,6 +554,12 @@ def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str
     """访问活动页面 URL，找到并下载第一个 .fit 文件。
 
     返回 (filename, fit_data) 或 None。即使活动有多个设备文件，也只下载第一个。
+
+    处理流程：
+      1. 访问 page_url（可能是 SendGrid 跟踪链接），跟随重定向到 Wahoo 活动页面
+      2. 如果重定向到 Wahoo 登录页，执行登录后重新访问
+      3. 在活动页面中查找 .fit 下载链接
+      4. 下载 .fit 文件
 
     Wahoo 活动页面结构（登录后）：
       - 页面顶部：活动概览（运动类型、时间、时长等）
@@ -507,11 +571,27 @@ def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str
     resp = session.get(page_url, timeout=30, allow_redirects=True)
     if resp.status_code != 200:
         logger.warning("访问活动页面失败: HTTP %d, URL: %s", resp.status_code, resp.url)
-        return []
+        return None
+
+    # 记录 SendGrid 重定向后的最终 URL
+    if resp.url != page_url:
+        logger.info("重定向到最终页面: %s", resp.url)
+
+    # 检查是否被重定向到登录页
+    resp_lower = resp.text.lower()
+    if "/login" in resp.url.lower() or ("email" in resp_lower and "password" in resp_lower and "saml" in resp_lower):
+        logger.warning("活动页面重定向到登录页，尝试登录后重新访问...")
+        if not login_wahoo(session):
+            logger.error("重新登录 Wahoo 失败")
+            return None
+        resp = session.get(page_url, timeout=30, allow_redirects=True)
+        if resp.status_code != 200:
+            logger.warning("重新访问活动页面仍失败: HTTP %d, URL: %s", resp.status_code, resp.url)
+            return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # 收集所有 <a> 链接（包括可能包含设备名称的 Files 区域链接）
+    # 收集所有 <a> 链接
     all_links = []
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"]
@@ -524,16 +604,14 @@ def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str
     # 收集所有以 .fit 结尾的直接链接
     fit_urls = []
     for href, text in all_links:
-        # 直接包含 .fit 扩展名
         if ".fit" in href.lower():
             fit_urls.append((href, text))
             logger.info("找到 .fit 链接: %s (设备: %s)", href, text)
-            continue
 
     # 如果没有找到任何 .fit 链接，尝试通过 Files 区域查找
     if not fit_urls:
         logger.info("未找到 .fit 链接，尝试通过页面结构查找 Files 区域...")
-        for elem in soup.find_all(text=re.compile(r"Files", re.IGNORECASE)):
+        for elem in soup.find_all(string=re.compile(r"Files", re.IGNORECASE)):
             parent = elem.parent
             for _ in range(5):
                 if parent is None:
@@ -542,18 +620,10 @@ def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str
                 for a in links:
                     href = a["href"]
                     text = a.get_text(strip=True)
-                    if not href.startswith("#") and "wahooligan.com" in href.lower():
+                    if not href.startswith("#") and ("wahooligan.com" in href.lower() or "cdn" in href.lower()):
                         fit_urls.append((href, text))
                         logger.info("从 Files 区域找到链接: %s (设备: %s)", href, text)
                 parent = parent.parent
-
-    # 备用：直接在页面 URL 后追加 .fit
-    if not fit_urls:
-        parsed = urlparse(page_url)
-        base_path = parsed.path.rstrip("/")
-        fit_url = f"{parsed.scheme}://{parsed.netloc}{base_path}.fit"
-        logger.info("尝试备用 URL: %s", fit_url)
-        fit_urls.append((fit_url, "backup"))
 
     if not fit_urls:
         logger.error("页面中未找到 .fit 下载链接: %s", page_url)
@@ -562,58 +632,7 @@ def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str
         with open(debug_file, "w", encoding="utf-8") as f:
             f.write(resp.text)
         logger.info("页面源码已保存到 %s 供调试", debug_file)
-        return []
-
-    logger.info("正在访问活动页面: %s", page_url)
-
-    resp = session.get(page_url, timeout=30, allow_redirects=True)
-    if resp.status_code != 200:
-        logger.warning("访问活动页面失败: HTTP %d, URL: %s", resp.status_code, resp.url)
-        return None
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # 收集所有 <a> 链接，优先找 .fit 结尾的
-    fit_urls = []
-    for a_tag in soup.find_all("a", href=True):
-        href = a_tag["href"]
-        text = a_tag.get_text(strip=True)
-        if ".fit" in href.lower():
-            fit_urls.append((href, text))
-            logger.info("找到 .fit 链接: %s (设备: %s)", href, text)
-
-    # 如果没有找到任何 .fit 链接，尝试通过 Files 区域查找
-    if not fit_urls:
-        logger.info("未找到 .fit 链接，尝试通过页面结构查找 Files 区域...")
-        for elem in soup.find_all(text=re.compile(r"Files", re.IGNORECASE)):
-            parent = elem.parent
-            for _ in range(5):
-                if parent is None:
-                    break
-                links = parent.find_all("a", href=True)
-                for a in links:
-                    href = a["href"]
-                    text = a.get_text(strip=True)
-                    if not href.startswith("#") and "wahooligan.com" in href.lower():
-                        fit_urls.append((href, text))
-                        logger.info("从 Files 区域找到链接: %s (设备: %s)", href, text)
-                parent = parent.parent
-
-    # 备用：直接在页面 URL 后追加 .fit
-    if not fit_urls:
-        parsed = urlparse(page_url)
-        base_path = parsed.path.rstrip("/")
-        fit_url = f"{parsed.scheme}://{parsed.netloc}{base_path}.fit"
-        logger.info("尝试备用 URL: %s", fit_url)
-        fit_urls.append((fit_url, "backup"))
-
-    if not fit_urls:
-        logger.error("页面中未找到 .fit 下载链接: %s", page_url)
-        FIT_DIR.mkdir(parents=True, exist_ok=True)
-        debug_file = FIT_DIR / f"debug_page_{url_to_workout_id(page_url)}.html"
-        with open(debug_file, "w", encoding="utf-8") as f:
-            f.write(resp.text)
-        logger.info("页面源码已保存到 %s 供调试", debug_file)
+        logger.info("最终页面 URL: %s", resp.url)
         return None
 
     # 只下载第一个 .fit 文件
@@ -621,10 +640,10 @@ def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str
 
     # 确保 URL 完整
     if fit_url.startswith("/"):
-        parsed = urlparse(page_url)
+        parsed = urlparse(resp.url)
         full_url = f"{parsed.scheme}://{parsed.netloc}{fit_url}"
     elif not fit_url.startswith("http"):
-        full_url = f"{page_url.rstrip('/')}/{fit_url}"
+        full_url = f"{resp.url.rstrip('/')}/{fit_url}"
     else:
         full_url = fit_url
 
@@ -795,9 +814,16 @@ def main():
     # Step 3: 登录 Wahoo
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
     })
 
     try:
