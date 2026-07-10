@@ -59,6 +59,9 @@ IMAP_PASSWORD = os.getenv("IMAP_PASSWORD", "")
 GARMIN_EMAIL = os.getenv("GARMIN_EMAIL", "")
 GARMIN_PASSWORD = os.getenv("GARMIN_PASSWORD", "")
 
+# 只搜索最近 N 天的邮件，避免历史邮件过多导致超时
+SYNC_DAYS = int(os.getenv("SYNC_DAYS", "3"))
+
 # Wahoo 邮件发件人 —— 可根据实际邮件调整
 WAHOO_SENDER = os.getenv("WAHOO_SENDER") or "wahoofitness.com"
 
@@ -155,19 +158,56 @@ def connect_imap() -> imaplib.IMAP4_SSL:
 
 
 def search_wahoo_emails(mail: imaplib.IMAP4_SSL) -> list[tuple[str, bytes]]:
-    """搜索 Wahoo 发来的邮件，返回 (邮件ID, 邮件原始数据) 列表。"""
-    logger.info("正在搜索来自 %s 的邮件...", WAHOO_SENDER)
+    """搜索最近 N 天内 Wahoo 发来的新邮件，返回 (邮件ID, 邮件原始数据) 列表。
 
-    # 搜索条件：FROM 包含 wahoofitness.com 的邮件
-    status, data = mail.search(None, f'(FROM "{WAHOO_SENDER}")')
+    优化策略：
+    1. 用 IMAP SINCE 日期过滤，不碰历史邮件
+    2. 先 fetch 邮件头（HEADER），用 Message-ID 去重
+    3. 只对未处理过的邮件 fetch 完整内容（RFC822）
+    """
+    from datetime import datetime, timedelta
+
+    since_date = (datetime.now() - timedelta(days=SYNC_DAYS)).strftime("%d-%b-%Y")
+    logger.info("正在搜索自 %s 以来来自 %s 的邮件...", since_date, WAHOO_SENDER)
+
+    # 搜索条件：FROM + SINCE 日期过滤
+    status, data = mail.search(None, f'(FROM "{WAHOO_SENDER}" SINCE {since_date})')
     if status != "OK":
         raise RuntimeError(f"IMAP 搜索失败: {status}")
 
     email_ids = data[0].split()
-    logger.info("找到 %d 封来自 Wahoo 的邮件", len(email_ids))
+    logger.info("找到 %d 封近期 Wahoo 邮件", len(email_ids))
 
-    results = []
+    if not email_ids:
+        return []
+
+    # 第一轮：只 fetch 邮件头，快速过滤已处理的邮件
+    new_email_ids = []
     for eid in email_ids:
+        # 只取头，几百字节 vs 完整邮件几十KB-百KB
+        status, header_data = mail.fetch(eid, "(BODY[HEADER])")
+        if status != "OK":
+            continue
+
+        raw_header = header_data[0][1]
+        msg = email.message_from_bytes(raw_header)
+        msg_id = msg.get("Message-ID", "")
+        mail_date = msg.get("Date", "")
+        fingerprint = get_email_fingerprint(eid.decode(), mail_date)
+
+        if fingerprint in PROCESSED_EMAIL_IDS:
+            continue
+
+        new_email_ids.append(eid)
+
+    logger.info("其中 %d 封是未处理的新邮件", len(new_email_ids))
+
+    if not new_email_ids:
+        return []
+
+    # 第二轮：只对新邮件 fetch 完整内容（含附件）
+    results = []
+    for eid in new_email_ids:
         status, msg_data = mail.fetch(eid, "(RFC822)")
         if status != "OK":
             logger.warning("获取邮件 %s 失败", eid)
