@@ -52,7 +52,7 @@ logger = logging.getLogger("wahoo-garmin-sync")
 # 配置（从环境变量读取）
 # ---------------------------------------------------------------------------
 IMAP_SERVER = os.getenv("IMAP_SERVER", "")
-IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+IMAP_PORT = 993  # IMAP over SSL 固定端口，无需配置
 IMAP_USER = os.getenv("IMAP_USER", "")
 IMAP_PASSWORD = os.getenv("IMAP_PASSWORD", "")
 
@@ -60,10 +60,10 @@ GARMIN_EMAIL = os.getenv("GARMIN_EMAIL", "")
 GARMIN_PASSWORD = os.getenv("GARMIN_PASSWORD", "")
 
 # Wahoo 邮件发件人 —— 可根据实际邮件调整
-WAHOO_SENDER = os.getenv("WAHOO_SENDER", "wahoofitness.com")
+WAHOO_SENDER = os.getenv("WAHOO_SENDER") or "wahoofitness.com"
 
 # 邮箱文件夹
-MAIL_FOLDER = os.getenv("MAIL_FOLDER", "INBOX")
+MAIL_FOLDER = os.getenv("MAIL_FOLDER") or "INBOX"
 
 # 本地工作目录
 WORK_DIR = Path(os.getenv("GITHUB_WORKSPACE", ".")) / "data"
