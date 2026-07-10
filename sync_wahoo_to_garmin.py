@@ -61,15 +61,15 @@ IMAP_PASSWORD = os.getenv("IMAP_PASSWORD", "")
 GARMIN_EMAIL = os.getenv("GARMIN_EMAIL", "")
 GARMIN_PASSWORD = os.getenv("GARMIN_PASSWORD", "")
 
-# 只搜索最近 N 天的邮件
-SYNC_DAYS = int(os.getenv("SYNC_DAYS", "3"))
+# 只搜索最近 N 天的邮件（覆盖周末不骑的情况）
+SYNC_DAYS = int(os.getenv("SYNC_DAYS", "7"))
 
-# 单次运行最多检查多少封邮件（最新的 N 封），防止超时
-# 1000 封约覆盖 1-2 周（假设每天收到 50-100 封邮件）
-MAX_EMAILS = int(os.getenv("MAX_EMAILS", "1000"))
+# 单次运行最多检查多少封邮件（最新的 N 封）
+# FROM 搜索已过滤为 Wahoo 邮件，通常只有几十封，100 封足够覆盖 1-2 周
+MAX_EMAILS = int(os.getenv("MAX_EMAILS", "100"))
 
-# Wahoo 邮件发件人 —— 可根据实际邮件调整（支持部分匹配，只要 From 包含该字符串就算）
-WAHOO_SENDER = os.getenv("WAHOO_SENDER") or "wahoofitness.com"
+# Wahoo 邮件发件人域名 —— 实际为 wahooligan.com（不是 wahoofitness.com）
+WAHOO_SENDER = os.getenv("WAHOO_SENDER") or "wahooligan.com"
 
 # 邮箱文件夹
 MAIL_FOLDER = os.getenv("MAIL_FOLDER") or "INBOX"

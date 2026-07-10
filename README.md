@@ -52,7 +52,7 @@ requirements.txt                # Python 依赖
 | `IMAP_PASSWORD` | `your_qq_authorization_code` | QQ 邮箱 IMAP 授权码（非登录密码） |
 | `GARMIN_EMAIL` | `your_garmin@email.com` | 佳明国区账户邮箱 |
 | `GARMIN_PASSWORD` | `your_garmin_password` | 佳明国区账户密码 |
-| `WAHOO_SENDER` | `wahoofitness.com` | （可选）Wahoo 发件人关键词 |
+| `WAHOO_SENDER` | `wahooligan.com` | （可选）Wahoo 发件人域名，实际为 `wahooligan.com` |
 | `MAIL_FOLDER` | `INBOX` | （可选）邮箱搜索文件夹 |
 
 ### 3. QQ 邮箱授权码获取方式
