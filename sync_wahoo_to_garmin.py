@@ -580,9 +580,11 @@ def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str
     if resp.url != page_url:
         logger.info("重定向到最终页面: %s", resp.url)
 
-    # 检查是否被重定向到登录页
+    # 检查是否被重定向到登录页（排除 saml/finish 等回调页）
     resp_lower = resp.text.lower()
-    if "/login" in resp.url.lower() or ("email" in resp_lower and "password" in resp_lower and "saml" in resp_lower):
+    is_login_url = resp.url.lower().endswith("/login") or resp.url.lower().endswith("/saml/auth")
+    is_login_content = "<input" in resp_lower and "email" in resp_lower and "password" in resp_lower
+    if is_login_url or is_login_content:
         logger.warning("活动页面重定向到登录页，尝试登录后重新访问...")
         if not login_wahoo(session):
             logger.error("重新登录 Wahoo 失败")
