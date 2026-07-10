@@ -8,6 +8,7 @@ venv/
 # 本地运行产生的数据
 data/
 *.fit
+*.html
 
 # IDE
 .vscode/
