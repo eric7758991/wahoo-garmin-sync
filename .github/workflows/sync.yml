@@ -30,7 +30,6 @@ jobs:
       - name: 运行同步脚本
         env:
           IMAP_SERVER: ${{ secrets.IMAP_SERVER }}
-          IMAP_PORT: ${{ secrets.IMAP_PORT }}
           IMAP_USER: ${{ secrets.IMAP_USER }}
           IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
