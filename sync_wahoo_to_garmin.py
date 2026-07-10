@@ -65,7 +65,8 @@ GARMIN_PASSWORD = os.getenv("GARMIN_PASSWORD", "")
 SYNC_DAYS = int(os.getenv("SYNC_DAYS", "1"))
 
 # 单次运行最多检查多少封邮件（最新的 N 封），防止超时
-MAX_EMAILS = int(os.getenv("MAX_EMAILS", "100"))
+# 500 封约覆盖 2-3 周（假设每天收到 20-30 封邮件）
+MAX_EMAILS = int(os.getenv("MAX_EMAILS", "500"))
 
 # Wahoo 邮件发件人 —— 可根据实际邮件调整
 WAHOO_SENDER = os.getenv("WAHOO_SENDER") or "wahoofitness.com"
@@ -196,77 +197,79 @@ def _is_recent_wahoo_email(raw_header: bytes) -> tuple[bool, str, str]:
 def search_wahoo_emails(mail: imaplib.IMAP4_SSL) -> list[tuple[str, bytes]]:
     """搜索 Wahoo 发来的新邮件，返回 (邮件ID, 邮件原始数据) 列表。
 
-    策略（适配各种 IMAP 实现）：
-    1. 先尝试 FROM 搜索，如果有效且返回结果很少，直接用
-    2. 如果 FROM 搜索无效/返回太多（如 QQ 邮箱），退回到 ALL 搜索
-    3. 只取最新的 MAX_EMAILS 封，每封只 fetch 精简头（几百字节），本地过滤
-    4. 只对有效的新邮件 fetch 完整内容（RFC822）
+    核心修正：FROM 搜索返回的结果直接保留（就是所有 Wahoo 邮件），
+    不再因为返回数量多就误判为"不生效"。只取最新的 MAX_EMAILS 封扫描。
     """
-    logger.info("正在获取邮箱中的邮件列表...")
+    logger.info("正在获取 Wahoo 邮件列表...")
 
-    # 策略 1：先尝试 FROM 搜索（大部分服务器支持，但 QQ 邮箱可能忽略）
+    # 步骤 1：用 FROM 搜索获取所有 Wahoo 邮件的 ID
     status, data = mail.search(None, 'FROM', f'"{WAHOO_SENDER}"')
-    email_ids = []
-    from_search_works = False
+    if status != "OK":
+        raise RuntimeError(f"IMAP 搜索失败: {status}")
 
-    if status == "OK":
-        email_ids = data[0].split()
-        if len(email_ids) < 200:  # 如果返回数量合理，说明 FROM 搜索生效了
-            from_search_works = True
-            logger.info("FROM 搜索生效，找到 %d 封 Wahoo 邮件", len(email_ids))
-        else:
-            logger.info("FROM 搜索返回 %d 封邮件（可能不生效），改用 ALL 搜索", len(email_ids))
-            email_ids = []
-
-    # 策略 2：FROM 搜索不生效，改用 ALL 搜索
-    if not from_search_works:
-        status, data = mail.search(None, "ALL")
-        if status != "OK":
-            raise RuntimeError(f"IMAP 搜索失败: {status}")
-        email_ids = data[0].split()
-        logger.info("邮箱共有 %d 封邮件", len(email_ids))
+    email_ids = data[0].split()
+    total_count = len(email_ids)
 
     if not email_ids:
-        logger.info("邮箱中没有邮件")
+        logger.info("没有找到来自 %s 的邮件", WAHOO_SENDER)
         return []
 
-    # 策略 3：只取最新的 MAX_EMAILS 封（邮件 ID 递增，新邮件 ID 更大）
+    logger.info("FROM 搜索返回 %d 封来自 %s 的邮件", total_count, WAHOO_SENDER)
+
+    # 步骤 2：只取最新的 MAX_EMAILS 封（UID 递增，编号越大越新）
     if len(email_ids) > MAX_EMAILS:
         email_ids = email_ids[-MAX_EMAILS:]
-        logger.info("只检查最新的 %d 封邮件", len(email_ids))
+        logger.info("扫描最新的 %d 封（共 %d 封）", MAX_EMAILS, total_count)
+    else:
+        logger.info("扫描全部 %d 封", len(email_ids))
 
-    # 策略 4：fetch 精简头，本地过滤 FROM + 日期 + 去重
-    new_email_ids: list[tuple[bytes, str, str]] = []  # (eid, date, msg_id)
+    # 步骤 3：逐个 fetch 精简头，过滤日期 + 去重
+    new_email_ids: list[bytes] = []
     checked_count = 0
+
     for eid in reversed(email_ids):  # 从新到旧
         checked_count += 1
 
-        status, header_data = mail.fetch(eid, "(BODY.PEEK[HEADER.FIELDS (FROM DATE MESSAGE-ID)])")
+        # 只取日期和消息 ID（FROM 已知，无需再检查）
+        status, header_data = mail.fetch(
+            eid, "(BODY.PEEK[HEADER.FIELDS (DATE MESSAGE-ID)])"
+        )
         if status != "OK":
             continue
 
         raw_header = header_data[0][1]
-        is_valid, mail_date, msg_id = _is_recent_wahoo_email(raw_header)
+        msg = email.message_from_bytes(raw_header)
+        mail_date = msg.get("Date", "")
+        msg_id = msg.get("Message-ID", "")
 
-        if not is_valid:
-            continue
+        # 日期过滤
+        if mail_date:
+            try:
+                dt = parsedate_to_datetime(mail_date)
+                cutoff = datetime.now(UTC) - timedelta(days=SYNC_DAYS)
+                if dt < cutoff:
+                    continue
+            except Exception:
+                pass
 
         # 去重检查
         fingerprint = get_email_fingerprint(eid.decode(), mail_date)
         if fingerprint in PROCESSED_EMAIL_IDS:
             continue
 
-        new_email_ids.append((eid, mail_date, msg_id))
+        new_email_ids.append(eid)
         logger.info("发现新 Wahoo 邮件: ID=%s, Date=%s", eid.decode(), mail_date[:30])
 
-    logger.info("检查了 %d 封邮件，发现 %d 封新的 Wahoo 邮件", checked_count, len(new_email_ids))
+    logger.info(
+        "检查了 %d 封邮件，发现 %d 封新的 Wahoo 邮件", checked_count, len(new_email_ids)
+    )
 
     if not new_email_ids:
         return []
 
-    # 策略 5：只对新邮件 fetch 完整内容（含附件）
+    # 步骤 4：只对新邮件 fetch 完整内容（含附件）
     results = []
-    for eid, mail_date, msg_id in new_email_ids:
+    for eid in new_email_ids:
         status, msg_data = mail.fetch(eid, "(RFC822)")
         if status != "OK":
             logger.warning("获取邮件 %s 完整内容失败", eid)
