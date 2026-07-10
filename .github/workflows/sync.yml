@@ -27,13 +27,15 @@ jobs:
       - name: 安装依赖
         run: |
           pip install --upgrade pip
-          pip install garminconnect
+          pip install -r requirements.txt
 
       - name: 运行同步脚本
         env:
           IMAP_SERVER: ${{ secrets.IMAP_SERVER }}
           IMAP_USER: ${{ secrets.IMAP_USER }}
           IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
+          WAHOO_EMAIL: ${{ secrets.WAHOO_EMAIL }}
+          WAHOO_PASSWORD: ${{ secrets.WAHOO_PASSWORD }}
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
           WAHOO_SENDER: ${{ secrets.WAHOO_SENDER }}
@@ -41,13 +43,13 @@ jobs:
         run: python sync_wahoo_to_garmin.py
 
       - name: 提交已处理记录
-        # 将 processed_emails.json 提交回仓库，用于下次运行去重
+        # 将 processed_workouts.json 提交回仓库，用于下次运行去重
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -f data/processed_emails.json ]; then
-            git add data/processed_emails.json
-            git commit -m "chore: update processed emails cache [skip ci]" || echo "No changes to commit"
+          if [ -f data/processed_workouts.json ]; then
+            git add data/processed_workouts.json
+            git commit -m "chore: update processed workouts cache [skip ci]" || echo "No changes to commit"
             git push || echo "Push failed, will retry next run"
           fi
         env:
