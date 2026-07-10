@@ -5,7 +5,7 @@ Wahoo Fitness .fit 文件自动同步到 Garmin Connect 国区账户。
 工作原理：
   1. 通过 IMAP 连接到邮箱，搜索 Wahoo 发来的活动邮件
   2. 从邮件中提取 .fit 附件并下载
-  3. 登录 Garmin Connect 国区（connect.garmin.cn）
+  3. 登录 Garmin Connect 国区 (connect.garmin.cn)
   4. 将 .fit 文件上传到佳明国区账户
   5. 记录已处理的邮件，避免重复上传
 
@@ -20,17 +20,19 @@ Wahoo Fitness .fit 文件自动同步到 Garmin Connect 国区账户。
   IMAP_PASSWORD    邮箱密码或应用专用密码
   GARMIN_EMAIL     佳明国区账户邮箱
   GARMIN_PASSWORD  佳明国区账户密码
-  WAHOO_SENDER     Wahoo 发件人地址（可选，默认 noreply@wahoofitness.com）
+  WAHOO_SENDER     Wahoo 发件人地址（可选，默认 wahoofitness.com）
   MAIL_FOLDER       邮箱中搜索的文件夹（可选，默认 INBOX）
+  SYNC_DAYS        只处理最近 N 天内的邮件（可选，默认 1）
+  MAX_EMAILS       单次运行最多检查多少封邮件（可选，默认 20）
 """
 
 import hashlib
 import imaplib
 import logging
 import os
-import re
 import sys
 import email
+from datetime import UTC, datetime, timedelta
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -59,8 +61,11 @@ IMAP_PASSWORD = os.getenv("IMAP_PASSWORD", "")
 GARMIN_EMAIL = os.getenv("GARMIN_EMAIL", "")
 GARMIN_PASSWORD = os.getenv("GARMIN_PASSWORD", "")
 
-# 只搜索最近 N 天的邮件，避免历史邮件过多导致超时
-SYNC_DAYS = int(os.getenv("SYNC_DAYS", "3"))
+# 只搜索最近 N 天的邮件
+SYNC_DAYS = int(os.getenv("SYNC_DAYS", "1"))
+
+# 单次运行最多检查多少封邮件（最新的 N 封），防止超时
+MAX_EMAILS = int(os.getenv("MAX_EMAILS", "20"))
 
 # Wahoo 邮件发件人 —— 可根据实际邮件调整
 WAHOO_SENDER = os.getenv("WAHOO_SENDER") or "wahoofitness.com"
@@ -74,7 +79,6 @@ FIT_DIR = WORK_DIR / "fit_files"
 PROCESSED_FILE = WORK_DIR / "processed_emails.json"
 
 # 已处理邮件 ID 缓存 —— 用于去重
-# 在 GitHub Actions 中每次运行都是全新环境，所以用 commit 回写文件的方式持久化
 PROCESSED_EMAIL_IDS: set[str] = set()
 
 
@@ -157,76 +161,113 @@ def connect_imap() -> imaplib.IMAP4_SSL:
     return mail
 
 
-def search_wahoo_emails(mail: imaplib.IMAP4_SSL) -> list[tuple[str, bytes]]:
-    """搜索最近 N 天内 Wahoo 发来的新邮件，返回 (邮件ID, 邮件原始数据) 列表。
+def _is_recent_wahoo_email(raw_header: bytes) -> tuple[bool, str, str]:
+    """检查邮件头是否属于最近的有效 Wahoo 邮件。
 
-    优化策略：
-    1. 用 IMAP SINCE 日期过滤，不碰历史邮件
-    2. 先 fetch 邮件头（HEADER），用 Message-ID 去重
-    3. 只对未处理过的邮件 fetch 完整内容（RFC822）
+    Args:
+        raw_header: 邮件头的原始 bytes
+
+    Returns:
+        (是否有效, 日期字符串, 邮件ID)
     """
-    from datetime import datetime, timedelta
+    msg = email.message_from_bytes(raw_header)
 
-    since_date = (datetime.now() - timedelta(days=SYNC_DAYS)).strftime("%d-%b-%Y")
-    logger.info("正在搜索自 %s 以来来自 %s 的邮件...", since_date, WAHOO_SENDER)
+    from_addr = msg.get("From", "").lower()
+    mail_date = msg.get("Date", "")
+    msg_id = msg.get("Message-ID", "")
 
-    # 搜索条件：FROM + SINCE 日期过滤
-    status, data = mail.search(None, f'(FROM "{WAHOO_SENDER}" SINCE {since_date})')
+    # FROM 过滤
+    if WAHOO_SENDER.lower() not in from_addr:
+        return False, mail_date, msg_id
+
+    # 日期过滤：只处理 SYNC_DAYS 天内的
+    if mail_date:
+        try:
+            dt = parsedate_to_datetime(mail_date)
+            cutoff = datetime.now(UTC) - timedelta(days=SYNC_DAYS)
+            if dt < cutoff:
+                return False, mail_date, msg_id
+        except Exception:
+            pass  # 日期解析失败就保留
+
+    return True, mail_date, msg_id
+
+
+def search_wahoo_emails(mail: imaplib.IMAP4_SSL) -> list[tuple[str, bytes]]:
+    """搜索 Wahoo 发来的新邮件，返回 (邮件ID, 邮件原始数据) 列表。
+
+    优化策略（应对 QQ 邮箱等 IMAP 实现不标准的问题）：
+    1. 用 search(ALL) 获取全部邮件 ID（兼容所有 IMAP 服务器）
+    2. 只取最新的 MAX_EMAILS 封（防止超时）
+    3. 每封只 fetch 精简头（几百字节），本地过滤 FROM + 日期 + 去重
+    4. 只对有效的新邮件 fetch 完整内容（RFC822，含附件）
+    """
+    logger.info("正在获取邮箱中的邮件列表...")
+
+    # 步骤 1：获取所有邮件 ID（只有 ID，不 fetch 内容，非常快）
+    status, data = mail.search(None, "ALL")
     if status != "OK":
         raise RuntimeError(f"IMAP 搜索失败: {status}")
 
-    email_ids = data[0].split()
-    logger.info("找到 %d 封近期 Wahoo 邮件", len(email_ids))
+    all_ids = data[0].split()
+    logger.info("邮箱共有 %d 封邮件，将检查最新的 %d 封", len(all_ids), MAX_EMAILS)
 
-    if not email_ids:
+    if not all_ids:
         return []
 
-    # 第一轮：只 fetch 邮件头，快速过滤已处理的邮件
-    new_email_ids = []
-    for eid in email_ids:
-        # 只取头，几百字节 vs 完整邮件几十KB-百KB
-        status, header_data = mail.fetch(eid, "(BODY[HEADER])")
+    # 步骤 2：只取最新的 MAX_EMAILS 封（邮件 ID 递增，新邮件 ID 更大）
+    recent_ids = all_ids[-MAX_EMAILS:]
+
+    # 步骤 3：每封只 fetch 精简头（几百字节）
+    new_email_ids: list[tuple[bytes, str, str]] = []  # (eid, date, msg_id)
+    checked_count = 0
+    for eid in reversed(recent_ids):  # 从新到旧检查
+        checked_count += 1
+
+        status, header_data = mail.fetch(eid, "(BODY.PEEK[HEADER.FIELDS (FROM DATE MESSAGE-ID)])")
         if status != "OK":
+            logger.warning("获取邮件 %s 头失败", eid)
             continue
 
         raw_header = header_data[0][1]
-        msg = email.message_from_bytes(raw_header)
-        msg_id = msg.get("Message-ID", "")
-        mail_date = msg.get("Date", "")
-        fingerprint = get_email_fingerprint(eid.decode(), mail_date)
+        is_valid, mail_date, msg_id = _is_recent_wahoo_email(raw_header)
 
+        if not is_valid:
+            continue
+
+        # 去重检查
+        fingerprint = get_email_fingerprint(eid.decode(), mail_date)
         if fingerprint in PROCESSED_EMAIL_IDS:
             continue
 
-        new_email_ids.append(eid)
+        new_email_ids.append((eid, mail_date, msg_id))
+        logger.info("发现新 Wahoo 邮件: ID=%s, Date=%s, MsgID=%s...",
+                    eid.decode(), mail_date[:30], msg_id[:30] if msg_id else "N/A")
 
-    logger.info("其中 %d 封是未处理的新邮件", len(new_email_ids))
+    logger.info("检查了 %d 封邮件，发现 %d 封新的 Wahoo 邮件", checked_count, len(new_email_ids))
 
     if not new_email_ids:
         return []
 
-    # 第二轮：只对新邮件 fetch 完整内容（含附件）
+    # 步骤 4：只对新邮件 fetch 完整内容（含附件）
     results = []
-    for eid in new_email_ids:
+    for eid, mail_date, msg_id in new_email_ids:
         status, msg_data = mail.fetch(eid, "(RFC822)")
         if status != "OK":
-            logger.warning("获取邮件 %s 失败", eid)
+            logger.warning("获取邮件 %s 完整内容失败", eid)
             continue
         results.append((eid.decode(), msg_data[0][1]))
 
     return results
 
 
-def extract_fit_attachments(
-    raw_email: bytes,
-) -> list[tuple[str, bytes]]:
+def extract_fit_attachments(raw_email: bytes) -> list[tuple[str, bytes]]:
     """从邮件中提取 .fit 附件。
 
     返回 [(文件名, 文件内容), ...]
     """
     msg = email.message_from_bytes(raw_email)
 
-    # 解析邮件基本信息用于日志
     subject = decode_mime_header(msg.get("Subject", ""))
     date_str = msg.get("Date", "")
     from_addr = msg.get("From", "")
@@ -236,46 +277,29 @@ def extract_fit_attachments(
     fit_files = []
     for part in msg.walk():
         content_disposition = str(part.get("Content-Disposition", ""))
-        content_type = part.get_content_type()
         filename = part.get_filename()
 
-        # 只处理附件
         if "attachment" not in content_disposition.lower():
             continue
 
         if not filename:
             continue
 
-        # 解码文件名
         filename = decode_mime_header(filename)
 
-        # 检查是否为 .fit 文件（不区分大小写）
         if not filename.lower().endswith(".fit"):
             logger.debug("跳过非 .fit 附件: %s", filename)
             continue
 
-        # 提取附件内容
         payload = part.get_payload(decode=True)
         if payload:
             fit_files.append((filename, payload))
             logger.info("找到 .fit 附件: %s (%d bytes)", filename, len(payload))
 
     if not fit_files:
-        logger.warning("邮件 '%s' 中未找到 .fit 附件", subject)
+        logger.warning("邮件中未找到 .fit 附件")
 
     return fit_files
-
-
-def get_email_message_id(raw_email: bytes) -> str:
-    """从邮件中提取 Message-ID。"""
-    msg = email.message_from_bytes(raw_email)
-    return msg.get("Message-ID", "")
-
-
-def get_email_date(raw_email: bytes) -> str:
-    """从邮件中提取日期。"""
-    msg = email.message_from_bytes(raw_email)
-    return msg.get("Date", "")
 
 
 # ---------------------------------------------------------------------------
@@ -288,11 +312,10 @@ def login_garmin_cn() -> Garmin:
 
     logger.info("正在登录 Garmin Connect 国区 (connect.garmin.cn) ...")
 
-    # is_cn=True 指定使用国区域名 garmin.cn
     client = Garmin(
         email=GARMIN_EMAIL,
         password=GARMIN_PASSWORD,
-        is_cn=True,  # 关键：使用佳明中国区
+        is_cn=True,
     )
 
     try:
@@ -305,20 +328,8 @@ def login_garmin_cn() -> Garmin:
     return client
 
 
-def upload_fit_to_garmin(
-    client: Garmin, filename: str, fit_data: bytes
-) -> bool:
-    """将 .fit 文件上传到 Garmin Connect。
-
-    Args:
-        client: 已登录的 Garmin 客户端
-        filename: .fit 文件名
-        fit_data: .fit 文件二进制内容
-
-    Returns:
-        True 表示上传成功，False 表示失败
-    """
-    # 将二进制内容写入临时文件
+def upload_fit_to_garmin(client: Garmin, filename: str, fit_data: bytes) -> bool:
+    """将 .fit 文件上传到 Garmin Connect。"""
     FIT_DIR.mkdir(parents=True, exist_ok=True)
     temp_path = FIT_DIR / filename
 
@@ -330,7 +341,7 @@ def upload_fit_to_garmin(
         result = client.upload_activity(str(temp_path))
 
         if result:
-            logger.info("上传成功！文件: %s, 返回: %s", filename, result)
+            logger.info("上传成功！文件: %s", filename)
             return True
         else:
             logger.warning("上传返回空结果，文件: %s", filename)
@@ -339,7 +350,6 @@ def upload_fit_to_garmin(
     except GarminConnectConnectionError as e:
         error_msg = str(e).lower()
 
-        # 如果是重复上传（409 Conflict），视为成功
         if "409" in error_msg or "already exists" in error_msg or "duplicate" in error_msg:
             logger.info("文件 %s 已存在于 Garmin Connect 中（重复上传，跳过）", filename)
             return True
@@ -352,7 +362,6 @@ def upload_fit_to_garmin(
         return False
 
     finally:
-        # 清理临时文件
         if temp_path.exists():
             temp_path.unlink()
 
@@ -364,6 +373,7 @@ def main():
     """主同步流程。"""
     logger.info("=" * 60)
     logger.info("Wahoo -> Garmin Connect 国区 自动同步")
+    logger.info(f"配置: SYNC_DAYS={SYNC_DAYS}, MAX_EMAILS={MAX_EMAILS}, WAHOO_SENDER={WAHOO_SENDER}")
     logger.info("=" * 60)
 
     # 检查必要环境变量
@@ -387,7 +397,7 @@ def main():
     # 加载已处理邮件记录
     load_processed_emails()
 
-    # Step 1: 连接 IMAP 并搜索 Wahoo 邮件
+    # Step 1: 连接 IMAP
     mail = None
     try:
         mail = connect_imap()
@@ -396,20 +406,16 @@ def main():
         return 1
 
     # Step 2: 搜索并提取 .fit 附件
-    new_fit_files: list[tuple[str, bytes, str]] = []  # (filename, data, email_fingerprint)
+    new_fit_files: list[tuple[str, bytes, str]] = []  # (filename, data, fingerprint)
     try:
         emails = search_wahoo_emails(mail)
 
         for eid, raw_email in emails:
-            msg_id = get_email_message_id(raw_email)
-            mail_date = get_email_date(raw_email)
+            msg = email.message_from_bytes(raw_email)
+            mail_date = msg.get("Date", "")
             fingerprint = get_email_fingerprint(eid, mail_date)
 
-            if fingerprint in PROCESSED_EMAIL_IDS:
-                logger.debug("跳过已处理邮件: %s (fingerprint: %s)", eid, fingerprint[:12])
-                continue
-
-            logger.info("处理新邮件: ID=%s, Date=%s", eid, mail_date)
+            logger.info("处理新邮件: ID=%s", eid)
 
             attachments = extract_fit_attachments(raw_email)
             for filename, fit_data in attachments:
@@ -436,7 +442,7 @@ def main():
 
     logger.info("共找到 %d 个新的 .fit 文件待上传", len(new_fit_files))
 
-    # Step 3: 登录 Garmin Connect 国区
+    # Step 3: 登录 Garmin
     garmin_client = None
     try:
         garmin_client = login_garmin_cn()
@@ -445,7 +451,7 @@ def main():
         save_processed_emails()
         return 1
 
-    # Step 4: 逐个上传 .fit 文件
+    # Step 4: 逐个上传
     success_count = 0
     fail_count = 0
 
@@ -455,19 +461,17 @@ def main():
             success_count += 1
         else:
             fail_count += 1
-            # 上传失败的邮件从已处理集合中移除，下次重试
+            # 上传失败的从已处理集合中移除，下次重试
             PROCESSED_EMAIL_IDS.discard(fingerprint)
             logger.warning("文件 %s 上传失败，将在下次运行时重试", filename)
 
-    # Step 5: 保存已处理记录
+    # Step 5: 保存记录
     save_processed_emails()
 
-    # 汇总
     logger.info("=" * 60)
     logger.info("同步完成！成功: %d, 失败: %d, 总计: %d", success_count, fail_count, len(new_fit_files))
     logger.info("=" * 60)
 
-    # 如果有失败，返回非零退出码（GitHub Actions 会标记为失败）
     return 1 if fail_count > 0 else 0
 
 
