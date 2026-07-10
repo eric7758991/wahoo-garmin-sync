@@ -493,26 +493,21 @@ def login_wahoo(session: requests.Session) -> bool:
 
 
 def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str, bytes] | None:
-    """访问活动页面 URL，从中找到 .fit 下载链接并下载。
+    """访问活动页面 URL，找到并下载第一个 .fit 文件。
+
+    返回 (filename, fit_data) 或 None。即使活动有多个设备文件，也只下载第一个。
 
     Wahoo 活动页面结构（登录后）：
       - 页面顶部：活动概览（运动类型、时间、时长等）
-      - Files 区域：列出设备名称作为蓝色下载链接（如 "Wahoo ELEMNT"）
-      - 每个蓝色链接指向该活动的 .fit 文件
-
-    策略：
-    1. 访问活动页面 URL
-    2. 解析 HTML，提取所有 <a> 标签链接
-    3. 筛选候选链接（wahooligan.com 域名下 + 可能指向文件下载）
-    4. 用 HEAD 请求探测 Content-Type，找到返回 fit/octet-stream 的链接
-    5. 下载该链接
+      - Files 区域：列出设备名称作为蓝色下载链接
+      - 每个蓝色链接指向一个 .fit 文件，一次活动可能有多个文件
     """
     logger.info("正在访问活动页面: %s", page_url)
 
     resp = session.get(page_url, timeout=30, allow_redirects=True)
     if resp.status_code != 200:
         logger.warning("访问活动页面失败: HTTP %d, URL: %s", resp.status_code, resp.url)
-        return None
+        return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -526,123 +521,94 @@ def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str
 
     logger.info("页面共有 %d 个 <a> 链接", len(all_links))
 
-    # 筛选候选下载链接：
-    # 1. 直接包含 .fit 扩展名
-    # 2. wahooligan.com 域名下且 URL 模式类似文件下载
-    # 3. 页面中 Files 区域的设备名称链接（需要根据页面结构识别）
-    candidate_urls = []
-
+    # 收集所有以 .fit 结尾的直接链接
+    fit_urls = []
     for href, text in all_links:
-        # 直接包含 .fit
+        # 直接包含 .fit 扩展名
         if ".fit" in href.lower():
-            candidate_urls.append(href)
-            logger.info("候选 .fit 链接: %s (文本: %s)", href, text)
+            fit_urls.append((href, text))
+            logger.info("找到 .fit 链接: %s (设备: %s)", href, text)
             continue
 
-        # 包含 download/export/export_activity 等关键词
-        if any(kw in href.lower() for kw in ["download", "export", ".fit"]):
-            candidate_urls.append(href)
-            logger.info("候选下载链接: %s (文本: %s)", href, text)
-            continue
-
-    # 如果仍无候选，尝试通过页面结构识别 Files 区域
-    # 查找包含 "Files" 或 "files" 文本的元素，其附近应有下载链接
-    if not candidate_urls:
-        logger.info("尝试通过页面结构查找 Files 区域...")
-        # 查找包含 "Files" 文本的元素
+    # 如果没有找到任何 .fit 链接，尝试通过 Files 区域查找
+    if not fit_urls:
+        logger.info("未找到 .fit 链接，尝试通过页面结构查找 Files 区域...")
         for elem in soup.find_all(text=re.compile(r"Files", re.IGNORECASE)):
             parent = elem.parent
-            # 向上查找几层，找到包含链接的容器
             for _ in range(5):
                 if parent is None:
                     break
                 links = parent.find_all("a", href=True)
                 for a in links:
                     href = a["href"]
-                    if href not in candidate_urls and not href.startswith("#"):
-                        candidate_urls.append(href)
-                        logger.info("从 Files 区域找到链接: %s (文本: %s)", href, a.get_text(strip=True))
+                    text = a.get_text(strip=True)
+                    if not href.startswith("#") and "wahooligan.com" in href.lower():
+                        fit_urls.append((href, text))
+                        logger.info("从 Files 区域找到链接: %s (设备: %s)", href, text)
                 parent = parent.parent
 
-    # 如果没有找到任何候选链接，尝试备用方案
-    if not candidate_urls:
-        # 备用 1: 直接在页面 URL 后追加 /download.fit
+    # 备用：直接在页面 URL 后追加 .fit
+    if not fit_urls:
         parsed = urlparse(page_url)
         base_path = parsed.path.rstrip("/")
-        candidate_urls.append(f"{parsed.scheme}://{parsed.netloc}{base_path}.fit")
-        candidate_urls.append(f"{parsed.scheme}://{parsed.netloc}{base_path}/download")
-        candidate_urls.append(f"{parsed.scheme}://{parsed.netloc}{base_path}/export")
-        logger.info("无候选链接，尝试备用 URL: %s", candidate_urls)
+        fit_url = f"{parsed.scheme}://{parsed.netloc}{base_path}.fit"
+        logger.info("尝试备用 URL: %s", fit_url)
+        fit_urls.append((fit_url, "backup"))
 
-    # 对候选链接逐一探测：
-    # 优先用 HEAD 请求检查 Content-Type，匹配 application/octet-stream 或 fit 相关类型
-    fit_link = None
-    for url in candidate_urls:
-        try:
-            # 确保 URL 完整
-            if url.startswith("/"):
-                parsed = urlparse(page_url)
-                full_url = f"{parsed.scheme}://{parsed.netloc}{url}"
-            elif not url.startswith("http"):
-                full_url = f"{page_url.rstrip('/')}/{url}"
-            else:
-                full_url = url
-
-            logger.info("探测链接: %s", full_url)
-            head_resp = session.head(full_url, timeout=15, allow_redirects=True)
-            content_type = head_resp.headers.get("Content-Type", "")
-            content_length = head_resp.headers.get("Content-Length", "0")
-            logger.info("  HEAD 结果: HTTP %d, Content-Type=%s, Content-Length=%s",
-                        head_resp.status_code, content_type, content_length)
-
-            if head_resp.status_code == 200:
-                # 判断是否为 .fit 文件：
-                # 1. Content-Type 包含 octet-stream / fit / garmin
-                # 2. Content-Length > 1KB（.fit 文件至少几百字节）
-                # 3. URL 以 .fit 结尾
-                is_fit = (
-                    ".fit" in full_url.lower()
-                    or "application/octet-stream" in content_type
-                    or "fit" in content_type.lower()
-                    or "application/vnd.garmin" in content_type.lower()
-                )
-                try:
-                    size = int(content_length) if content_length else 0
-                except ValueError:
-                    size = 0
-                if is_fit and size > 500:
-                    fit_link = full_url
-                    logger.info("找到 .fit 文件链接: %s (大小: %s bytes)", full_url, content_length)
-                    break
-
-                # 如果不是 fit 文件，但返回了页面（text/html），
-                # 它可能是中间跳转页，继续探测下一个
-                if "text/html" in content_type:
-                    logger.debug("  返回 HTML 页面，跳过")
-                    continue
-
-        except Exception as e:
-            logger.warning("探测链接 %s 失败: %s", url, e)
-            continue
-
-    # 如果 HEAD 没找到，但候选 URL 以 .fit 结尾，直接尝试 GET（有些服务器不支持 HEAD）
-    if not fit_link:
-        for url in candidate_urls:
-            if ".fit" in url.lower():
-                if url.startswith("/"):
-                    parsed = urlparse(page_url)
-                    full_url = f"{parsed.scheme}://{parsed.netloc}{url}"
-                elif not url.startswith("http"):
-                    full_url = f"{page_url.rstrip('/')}/{url}"
-                else:
-                    full_url = url
-                logger.info("HEAD 未命中，直接 GET 尝试: %s", full_url)
-                fit_link = full_url
-                break
-
-    if not fit_link:
+    if not fit_urls:
         logger.error("页面中未找到 .fit 下载链接: %s", page_url)
-        # 保存页面源码用于调试
+        FIT_DIR.mkdir(parents=True, exist_ok=True)
+        debug_file = FIT_DIR / f"debug_page_{url_to_workout_id(page_url)}.html"
+        with open(debug_file, "w", encoding="utf-8") as f:
+            f.write(resp.text)
+        logger.info("页面源码已保存到 %s 供调试", debug_file)
+        return []
+
+    logger.info("正在访问活动页面: %s", page_url)
+
+    resp = session.get(page_url, timeout=30, allow_redirects=True)
+    if resp.status_code != 200:
+        logger.warning("访问活动页面失败: HTTP %d, URL: %s", resp.status_code, resp.url)
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # 收集所有 <a> 链接，优先找 .fit 结尾的
+    fit_urls = []
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag["href"]
+        text = a_tag.get_text(strip=True)
+        if ".fit" in href.lower():
+            fit_urls.append((href, text))
+            logger.info("找到 .fit 链接: %s (设备: %s)", href, text)
+
+    # 如果没有找到任何 .fit 链接，尝试通过 Files 区域查找
+    if not fit_urls:
+        logger.info("未找到 .fit 链接，尝试通过页面结构查找 Files 区域...")
+        for elem in soup.find_all(text=re.compile(r"Files", re.IGNORECASE)):
+            parent = elem.parent
+            for _ in range(5):
+                if parent is None:
+                    break
+                links = parent.find_all("a", href=True)
+                for a in links:
+                    href = a["href"]
+                    text = a.get_text(strip=True)
+                    if not href.startswith("#") and "wahooligan.com" in href.lower():
+                        fit_urls.append((href, text))
+                        logger.info("从 Files 区域找到链接: %s (设备: %s)", href, text)
+                parent = parent.parent
+
+    # 备用：直接在页面 URL 后追加 .fit
+    if not fit_urls:
+        parsed = urlparse(page_url)
+        base_path = parsed.path.rstrip("/")
+        fit_url = f"{parsed.scheme}://{parsed.netloc}{base_path}.fit"
+        logger.info("尝试备用 URL: %s", fit_url)
+        fit_urls.append((fit_url, "backup"))
+
+    if not fit_urls:
+        logger.error("页面中未找到 .fit 下载链接: %s", page_url)
         FIT_DIR.mkdir(parents=True, exist_ok=True)
         debug_file = FIT_DIR / f"debug_page_{url_to_workout_id(page_url)}.html"
         with open(debug_file, "w", encoding="utf-8") as f:
@@ -650,28 +616,41 @@ def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str
         logger.info("页面源码已保存到 %s 供调试", debug_file)
         return None
 
-    # 下载 .fit 文件
-    logger.info("正在下载 .fit 文件: %s", fit_link)
-    resp = session.get(fit_link, timeout=60, allow_redirects=True)
-    if resp.status_code != 200:
-        logger.error("下载 .fit 失败: HTTP %d", resp.status_code)
+    # 只下载第一个 .fit 文件
+    fit_url, device_name = fit_urls[0]
+
+    # 确保 URL 完整
+    if fit_url.startswith("/"):
+        parsed = urlparse(page_url)
+        full_url = f"{parsed.scheme}://{parsed.netloc}{fit_url}"
+    elif not fit_url.startswith("http"):
+        full_url = f"{page_url.rstrip('/')}/{fit_url}"
+    else:
+        full_url = fit_url
+
+    logger.info("正在下载设备 %s 的 .fit 文件: %s", device_name, full_url)
+    try:
+        resp = session.get(full_url, timeout=60, allow_redirects=True)
+        if resp.status_code != 200:
+            logger.error("下载 .fit 失败: HTTP %d (%s)", resp.status_code, device_name)
+            return None
+
+        fit_data = resp.content
+        if len(fit_data) < 100:
+            logger.error("下载的 .fit 文件过小 (%d bytes) (%s)", len(fit_data), device_name)
+            return None
+
+        # 从 URL 提取文件名
+        filename = full_url.split("/")[-1]
+        if not filename or ".fit" not in filename.lower():
+            workout_id = url_to_workout_id(page_url)
+            filename = f"wahoo_{workout_id}.fit"
+
+        logger.info("下载成功: %s (%d bytes, 设备: %s)", filename, len(fit_data), device_name)
+        return filename, fit_data
+    except Exception as e:
+        logger.error("下载 %s 失败: %s", device_name, e)
         return None
-
-    fit_data = resp.content
-    if len(fit_data) < 100:
-        logger.error("下载的 .fit 文件过小 (%d bytes)，可能不是有效文件", len(fit_data))
-        return None
-
-    # 从 URL 或 header 提取文件名
-    filename = f"wahoo_{url_to_workout_id(page_url)}.fit"
-    content_disposition = resp.headers.get("Content-Disposition", "")
-    if content_disposition:
-        fname_match = re.search(r'filename[^;=\n]*=([^;\n]*)', content_disposition)
-        if fname_match:
-            filename = fname_match.group(1).strip('"\' ')
-
-    logger.info("下载成功: %s (%d bytes)", filename, len(fit_data))
-    return filename, fit_data
 
 
 # ---------------------------------------------------------------------------
@@ -830,7 +809,7 @@ def main():
         return 1
 
     # Step 4: 逐个访问链接，下载 .fit 文件
-    downloaded_files: list[tuple[str, bytes, str]] = []
+    downloaded_files: list[tuple[str, bytes, str]] = []  # (filename, data, workout_id)
 
     for url in new_urls:
         workout_id = url_to_workout_id(url)
