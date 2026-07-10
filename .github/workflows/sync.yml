@@ -12,6 +12,8 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write  # 需要写权限才能 push 去重缓存文件
 
     steps:
       - name: Checkout 代码
