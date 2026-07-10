@@ -42,6 +42,17 @@ jobs:
           MAIL_FOLDER: ${{ secrets.MAIL_FOLDER }}
         run: python sync_wahoo_to_garmin.py
 
+      - name: 上传调试产物
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-pages
+          path: |
+            data/fit_files/debug_*.html
+            data/fit_files/debug_*.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
       - name: 提交已处理记录
         # 将 processed_workouts.json 提交回仓库，用于下次运行去重
         run: |
