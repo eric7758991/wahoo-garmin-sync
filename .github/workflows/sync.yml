@@ -59,7 +59,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           if [ -f data/processed_workouts.json ]; then
-            git add data/processed_workouts.json
+            git add -f data/processed_workouts.json
             git commit -m "chore: update processed workouts cache [skip ci]" || echo "No changes to commit"
             git push || echo "Push failed, will retry next run"
           fi
