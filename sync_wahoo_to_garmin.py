@@ -41,6 +41,7 @@ from datetime import UTC, datetime, timedelta
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -334,6 +335,30 @@ def extract_download_urls(raw_email: bytes) -> list[str]:
 
     full_body = "\n".join(body_parts)
 
+    # 策略 0: 从 HTML <a> 标签的 href 属性中提取链接
+    # 邮件中的链接通常是 <a href="https://...">download.fit</a> 形式
+    # BeautifulSoup 能正确从纯文本正则无法捕获的超链接中提取 href
+    soup = BeautifulSoup(full_body, "html.parser")
+    anchor_urls = []
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag["href"]
+        text = a_tag.get_text(strip=True).lower()
+        # 只保留包含 wahooligan.com 的链接，或文本含 download/fit/export 的链接
+        if "wahooligan.com" in href.lower() or any(kw in text for kw in ["download", "fit", "export"]):
+            anchor_urls.append(href)
+            logger.debug("HTML <a> 标签链接: href=%s, text=%s", href, text)
+    if anchor_urls:
+        seen = set()
+        unique_urls = []
+        for url in anchor_urls:
+            if url not in seen:
+                seen.add(url)
+                unique_urls.append(url)
+        logger.info("从 HTML <a> 标签提取到 %d 个链接", len(unique_urls))
+        for url in unique_urls:
+            logger.info("  链接: %s", url)
+        return unique_urls
+
     # 策略 1: 匹配 wahooligan.com 域名下的所有 URL
     wahoo_urls = re.findall(
         r'https?://[^\s"\'<>]*wahooligan\.com/[^\s"\'<>]+',
@@ -470,12 +495,17 @@ def login_wahoo(session: requests.Session) -> bool:
 def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str, bytes] | None:
     """访问活动页面 URL，从中找到 .fit 下载链接并下载。
 
+    Wahoo 活动页面结构（登录后）：
+      - 页面顶部：活动概览（运动类型、时间、时长等）
+      - Files 区域：列出设备名称作为蓝色下载链接（如 "Wahoo ELEMNT"）
+      - 每个蓝色链接指向该活动的 .fit 文件
+
     策略：
-    1. 访问页面 URL，解析 HTML 寻找 .fit 下载链接
-    2. 查找包含 download/export 相关的链接
-    3. 查找按钮或 data 属性中的下载 URL
-    4. 在 JavaScript 代码中查找 .fit URL
-    5. 尝试在 URL 后追加常见下载路径
+    1. 访问活动页面 URL
+    2. 解析 HTML，提取所有 <a> 标签链接
+    3. 筛选候选链接（wahooligan.com 域名下 + 可能指向文件下载）
+    4. 用 HEAD 请求探测 Content-Type，找到返回 fit/octet-stream 的链接
+    5. 下载该链接
     """
     logger.info("正在访问活动页面: %s", page_url)
 
@@ -486,73 +516,129 @@ def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    fit_link = None
-
-    # 策略 1: 查找包含 .fit 的链接
+    # 收集所有 <a> 链接（包括可能包含设备名称的 Files 区域链接）
+    all_links = []
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"]
+        text = a_tag.get_text(strip=True)
+        all_links.append((href, text))
+        logger.debug("页面链接: href=%s, text=%s", href, text)
+
+    logger.info("页面共有 %d 个 <a> 链接", len(all_links))
+
+    # 筛选候选下载链接：
+    # 1. 直接包含 .fit 扩展名
+    # 2. wahooligan.com 域名下且 URL 模式类似文件下载
+    # 3. 页面中 Files 区域的设备名称链接（需要根据页面结构识别）
+    candidate_urls = []
+
+    for href, text in all_links:
+        # 直接包含 .fit
         if ".fit" in href.lower():
-            fit_link = href
-            logger.info("在页面中找到 .fit 链接: %s", href)
-            break
+            candidate_urls.append(href)
+            logger.info("候选 .fit 链接: %s (文本: %s)", href, text)
+            continue
 
-    # 策略 2: 查找 download/export 相关链接
-    if not fit_link:
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"].lower()
-            text = a_tag.get_text(strip=True).lower()
-            if "download" in href or "download" in text or "export" in href or "export" in text:
-                fit_link = a_tag["href"]
-                logger.info("找到下载链接: %s (文本: %s)", fit_link, text)
-                break
+        # 包含 download/export/export_activity 等关键词
+        if any(kw in href.lower() for kw in ["download", "export", ".fit"]):
+            candidate_urls.append(href)
+            logger.info("候选下载链接: %s (文本: %s)", href, text)
+            continue
 
-    # 策略 3: 查找按钮或 data 属性中的下载 URL
-    if not fit_link:
-        for btn in soup.find_all(["button", "a"], attrs=True):
-            for attr_name, attr_val in btn.attrs.items():
-                if isinstance(attr_val, str) and ".fit" in attr_val.lower():
-                    fit_link = attr_val
-                    logger.info("在属性 %s 中找到 .fit 链接: %s", attr_name, fit_link)
+    # 如果仍无候选，尝试通过页面结构识别 Files 区域
+    # 查找包含 "Files" 或 "files" 文本的元素，其附近应有下载链接
+    if not candidate_urls:
+        logger.info("尝试通过页面结构查找 Files 区域...")
+        # 查找包含 "Files" 文本的元素
+        for elem in soup.find_all(text=re.compile(r"Files", re.IGNORECASE)):
+            parent = elem.parent
+            # 向上查找几层，找到包含链接的容器
+            for _ in range(5):
+                if parent is None:
                     break
-            if fit_link:
-                break
+                links = parent.find_all("a", href=True)
+                for a in links:
+                    href = a["href"]
+                    if href not in candidate_urls and not href.startswith("#"):
+                        candidate_urls.append(href)
+                        logger.info("从 Files 区域找到链接: %s (文本: %s)", href, a.get_text(strip=True))
+                parent = parent.parent
 
-    # 策略 4: 在 JavaScript 代码中查找 .fit URL
-    if not fit_link:
-        for script in soup.find_all("script"):
-            script_text = script.string or ""
-            fit_match = re.search(r'["\']([^"\']*\.fit[^"\']*)["\']', script_text, re.IGNORECASE)
-            if fit_match:
-                fit_link = fit_match.group(1)
-                logger.info("在 JS 中找到 .fit 链接: %s", fit_link)
-                break
+    # 如果没有找到任何候选链接，尝试备用方案
+    if not candidate_urls:
+        # 备用 1: 直接在页面 URL 后追加 /download.fit
+        parsed = urlparse(page_url)
+        base_path = parsed.path.rstrip("/")
+        candidate_urls.append(f"{parsed.scheme}://{parsed.netloc}{base_path}.fit")
+        candidate_urls.append(f"{parsed.scheme}://{parsed.netloc}{base_path}/download")
+        candidate_urls.append(f"{parsed.scheme}://{parsed.netloc}{base_path}/export")
+        logger.info("无候选链接，尝试备用 URL: %s", candidate_urls)
 
-    # 策略 5: 尝试在页面 URL 后追加常见下载路径
-    if not fit_link:
-        base_url = page_url.rstrip("/")
-        candidate_urls = [
-            f"{base_url}.fit",
-            f"{base_url}/download",
-            f"{base_url}/download.fit",
-            f"{base_url}/export.fit",
-            # 也尝试用 .fit 替换最后一段路径
-            re.sub(r'/[^/]+$', '.fit', base_url),
-            re.sub(r'/[^/]+$', '/download', base_url),
-        ]
-        for url in candidate_urls:
-            try:
-                head_resp = session.head(url, timeout=15, allow_redirects=True)
-                content_type = head_resp.headers.get("Content-Type", "")
-                if head_resp.status_code == 200 and (
-                    "application/octet-stream" in content_type
+    # 对候选链接逐一探测：
+    # 优先用 HEAD 请求检查 Content-Type，匹配 application/octet-stream 或 fit 相关类型
+    fit_link = None
+    for url in candidate_urls:
+        try:
+            # 确保 URL 完整
+            if url.startswith("/"):
+                parsed = urlparse(page_url)
+                full_url = f"{parsed.scheme}://{parsed.netloc}{url}"
+            elif not url.startswith("http"):
+                full_url = f"{page_url.rstrip('/')}/{url}"
+            else:
+                full_url = url
+
+            logger.info("探测链接: %s", full_url)
+            head_resp = session.head(full_url, timeout=15, allow_redirects=True)
+            content_type = head_resp.headers.get("Content-Type", "")
+            content_length = head_resp.headers.get("Content-Length", "0")
+            logger.info("  HEAD 结果: HTTP %d, Content-Type=%s, Content-Length=%s",
+                        head_resp.status_code, content_type, content_length)
+
+            if head_resp.status_code == 200:
+                # 判断是否为 .fit 文件：
+                # 1. Content-Type 包含 octet-stream / fit / garmin
+                # 2. Content-Length > 1KB（.fit 文件至少几百字节）
+                # 3. URL 以 .fit 结尾
+                is_fit = (
+                    ".fit" in full_url.lower()
+                    or "application/octet-stream" in content_type
                     or "fit" in content_type.lower()
                     or "application/vnd.garmin" in content_type.lower()
-                ):
-                    fit_link = url
-                    logger.info("HEAD 探测成功: %s (Content-Type: %s)", url, content_type)
+                )
+                try:
+                    size = int(content_length) if content_length else 0
+                except ValueError:
+                    size = 0
+                if is_fit and size > 500:
+                    fit_link = full_url
+                    logger.info("找到 .fit 文件链接: %s (大小: %s bytes)", full_url, content_length)
                     break
-            except Exception:
-                continue
+
+                # 如果不是 fit 文件，但返回了页面（text/html），
+                # 它可能是中间跳转页，继续探测下一个
+                if "text/html" in content_type:
+                    logger.debug("  返回 HTML 页面，跳过")
+                    continue
+
+        except Exception as e:
+            logger.warning("探测链接 %s 失败: %s", url, e)
+            continue
+
+    # 如果 HEAD 没找到，但候选 URL 以 .fit 结尾，直接尝试 GET（有些服务器不支持 HEAD）
+    if not fit_link:
+        for url in candidate_urls:
+            if ".fit" in url.lower():
+                if url.startswith("/"):
+                    parsed = urlparse(page_url)
+                    full_url = f"{parsed.scheme}://{parsed.netloc}{url}"
+                elif not url.startswith("http"):
+                    full_url = f"{page_url.rstrip('/')}/{url}"
+                else:
+                    full_url = url
+                logger.info("HEAD 未命中，直接 GET 尝试: %s", full_url)
+                fit_link = full_url
+                break
 
     if not fit_link:
         logger.error("页面中未找到 .fit 下载链接: %s", page_url)
@@ -563,14 +649,6 @@ def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str
             f.write(resp.text)
         logger.info("页面源码已保存到 %s 供调试", debug_file)
         return None
-
-    # 构造完整 URL
-    if fit_link.startswith("/"):
-        from urllib.parse import urlparse
-        parsed = urlparse(page_url)
-        fit_link = f"{parsed.scheme}://{parsed.netloc}{fit_link}"
-    elif not fit_link.startswith("http"):
-        fit_link = f"{page_url.rstrip('/')}/{fit_link}"
 
     # 下载 .fit 文件
     logger.info("正在下载 .fit 文件: %s", fit_link)
