@@ -48,7 +48,6 @@ requirements.txt                # Python 依赖
 | Secret 名称 | 值 | 说明 |
 |---|---|---|
 | `IMAP_SERVER` | `imap.qq.com` | QQ 邮箱 IMAP 服务器地址 |
-| `IMAP_PORT` | `993` | IMAP 端口（SSL） |
 | `IMAP_USER` | `your_email@qq.com` | 接收 Wahoo 邮件的 QQ 邮箱地址 |
 | `IMAP_PASSWORD` | `your_qq_authorization_code` | QQ 邮箱 IMAP 授权码（非登录密码） |
 | `GARMIN_EMAIL` | `your_garmin@email.com` | 佳明国区账户邮箱 |
