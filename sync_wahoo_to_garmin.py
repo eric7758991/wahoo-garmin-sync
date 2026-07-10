@@ -62,11 +62,11 @@ GARMIN_EMAIL = os.getenv("GARMIN_EMAIL", "")
 GARMIN_PASSWORD = os.getenv("GARMIN_PASSWORD", "")
 
 # 只搜索最近 N 天的邮件
-SYNC_DAYS = int(os.getenv("SYNC_DAYS", "1"))
+SYNC_DAYS = int(os.getenv("SYNC_DAYS", "3"))
 
 # 单次运行最多检查多少封邮件（最新的 N 封），防止超时
-# 500 封约覆盖 2-3 周（假设每天收到 20-30 封邮件）
-MAX_EMAILS = int(os.getenv("MAX_EMAILS", "500"))
+# 1000 封约覆盖 1-2 周（假设每天收到 50-100 封邮件）
+MAX_EMAILS = int(os.getenv("MAX_EMAILS", "1000"))
 
 # Wahoo 邮件发件人 —— 可根据实际邮件调整（支持部分匹配，只要 From 包含该字符串就算）
 WAHOO_SENDER = os.getenv("WAHOO_SENDER") or "wahoofitness.com"
@@ -199,7 +199,8 @@ def search_wahoo_emails(mail: imaplib.IMAP4_SSL) -> list[tuple[str, bytes]]:
     logger.info("正在获取 Wahoo 邮件列表...")
 
     # 步骤 1：用 FROM 搜索获取所有 Wahoo 邮件的 ID
-    status, data = mail.search(None, 'FROM', f'"{WAHOO_SENDER}"')
+    # 注意：QQ 邮箱只支持复合括号语法 (FROM "x")，不支持独立键 FROM "x"
+    status, data = mail.search(None, f'(FROM "{WAHOO_SENDER}")')
     if status != "OK":
         raise RuntimeError(f"IMAP 搜索失败: {status}")
 
