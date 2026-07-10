@@ -68,7 +68,7 @@ SYNC_DAYS = int(os.getenv("SYNC_DAYS", "1"))
 # 500 封约覆盖 2-3 周（假设每天收到 20-30 封邮件）
 MAX_EMAILS = int(os.getenv("MAX_EMAILS", "500"))
 
-# Wahoo 邮件发件人 —— 可根据实际邮件调整
+# Wahoo 邮件发件人 —— 可根据实际邮件调整（支持部分匹配，只要 From 包含该字符串就算）
 WAHOO_SENDER = os.getenv("WAHOO_SENDER") or "wahoofitness.com"
 
 # 邮箱文件夹
@@ -177,8 +177,8 @@ def _is_recent_wahoo_email(raw_header: bytes) -> tuple[bool, str, str]:
     mail_date = msg.get("Date", "")
     msg_id = msg.get("Message-ID", "")
 
-    # FROM 过滤
-    if WAHOO_SENDER.lower() not in from_addr:
+    # FROM 过滤：部分匹配，只要包含 wahoofitness 或 wahoo 就算
+    if "wahoo" not in from_addr:
         return False, mail_date, msg_id
 
     # 日期过滤：只处理 SYNC_DAYS 天内的
@@ -195,11 +195,7 @@ def _is_recent_wahoo_email(raw_header: bytes) -> tuple[bool, str, str]:
 
 
 def search_wahoo_emails(mail: imaplib.IMAP4_SSL) -> list[tuple[str, bytes]]:
-    """搜索 Wahoo 发来的新邮件，返回 (邮件ID, 邮件原始数据) 列表。
-
-    核心修正：FROM 搜索返回的结果直接保留（就是所有 Wahoo 邮件），
-    不再因为返回数量多就误判为"不生效"。只取最新的 MAX_EMAILS 封扫描。
-    """
+    """搜索 Wahoo 发来的新邮件，返回 (邮件ID, 邮件原始数据) 列表。"""
     logger.info("正在获取 Wahoo 邮件列表...")
 
     # 步骤 1：用 FROM 搜索获取所有 Wahoo 邮件的 ID
@@ -210,11 +206,37 @@ def search_wahoo_emails(mail: imaplib.IMAP4_SSL) -> list[tuple[str, bytes]]:
     email_ids = data[0].split()
     total_count = len(email_ids)
 
-    if not email_ids:
-        logger.info("没有找到来自 %s 的邮件", WAHOO_SENDER)
-        return []
+    if total_count == 0:
+        # FROM 搜索没找到，可能是发件人写法不对
+        # 诊断：打印最近 10 封邮件的发件人
+        logger.warning("FROM 搜索 '%s' 返回 0 封，正在诊断最近邮件的发件人...", WAHOO_SENDER)
+        diag_status, diag_data = mail.search(None, "ALL")
+        if diag_status == "OK":
+            all_ids = diag_data[0].split()
+            if all_ids:
+                recent = all_ids[-10:] if len(all_ids) > 10 else all_ids
+                for eid in reversed(recent):
+                    ds, dd = mail.fetch(eid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
+                    if ds == "OK":
+                        hdr = dd[0][1]
+                        m = email.message_from_bytes(hdr)
+                        logger.info("  最近邮件 From='%s' Subject='%s'", m.get("From", ""), m.get("Subject", "")[:50])
 
-    logger.info("FROM 搜索返回 %d 封来自 %s 的邮件", total_count, WAHOO_SENDER)
+        # 退回到 ALL 搜索 + 本地 FROM 过滤
+        logger.warning("退回到 ALL 搜索 + 本地过滤...")
+        status, data = mail.search(None, "ALL")
+        if status != "OK":
+            raise RuntimeError(f"IMAP 搜索失败: {status}")
+        email_ids = data[0].split()
+        total_count = len(email_ids)
+
+        if not email_ids:
+            logger.info("邮箱中没有邮件")
+            return []
+
+        logger.info("邮箱共有 %d 封邮件", total_count)
+    else:
+        logger.info("FROM 搜索返回 %d 封来自 %s 的邮件", total_count, WAHOO_SENDER)
 
     # 步骤 2：只取最新的 MAX_EMAILS 封（UID 递增，编号越大越新）
     if len(email_ids) > MAX_EMAILS:
@@ -223,34 +245,24 @@ def search_wahoo_emails(mail: imaplib.IMAP4_SSL) -> list[tuple[str, bytes]]:
     else:
         logger.info("扫描全部 %d 封", len(email_ids))
 
-    # 步骤 3：逐个 fetch 精简头，过滤日期 + 去重
+    # 步骤 3：逐个 fetch 精简头，过滤 FROM + 日期 + 去重
     new_email_ids: list[bytes] = []
     checked_count = 0
 
     for eid in reversed(email_ids):  # 从新到旧
         checked_count += 1
 
-        # 只取日期和消息 ID（FROM 已知，无需再检查）
         status, header_data = mail.fetch(
-            eid, "(BODY.PEEK[HEADER.FIELDS (DATE MESSAGE-ID)])"
+            eid, "(BODY.PEEK[HEADER.FIELDS (FROM DATE MESSAGE-ID)])"
         )
         if status != "OK":
             continue
 
         raw_header = header_data[0][1]
-        msg = email.message_from_bytes(raw_header)
-        mail_date = msg.get("Date", "")
-        msg_id = msg.get("Message-ID", "")
+        is_valid, mail_date, msg_id = _is_recent_wahoo_email(raw_header)
 
-        # 日期过滤
-        if mail_date:
-            try:
-                dt = parsedate_to_datetime(mail_date)
-                cutoff = datetime.now(UTC) - timedelta(days=SYNC_DAYS)
-                if dt < cutoff:
-                    continue
-            except Exception:
-                pass
+        if not is_valid:
+            continue
 
         # 去重检查
         fingerprint = get_email_fingerprint(eid.decode(), mail_date)
