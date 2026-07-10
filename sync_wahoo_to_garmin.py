@@ -594,6 +594,36 @@ def download_fit_from_url(session: requests.Session, page_url: str) -> tuple[str
             logger.warning("重新访问活动页面仍失败: HTTP %d, URL: %s", resp.status_code, resp.url)
             return None
 
+    # 检查是否是 SAML 回调页（saml/finish）—— 包含自动提交的 POST 表单
+    if "/saml/finish" in resp.url.lower():
+        logger.info("检测到 SAML 回调页，正在自动提交认证表单...")
+        soup = BeautifulSoup(resp.text, "html.parser")
+        form = soup.find("form", method=re.compile(r"post", re.IGNORECASE))
+        if form:
+            action = form.get("action", resp.url)
+            inputs = {}
+            for inp in form.find_all("input"):
+                name = inp.get("name", "")
+                value = inp.get("value", "")
+                if name:
+                    inputs[name] = value
+            # 使用当前响应 URL 解析 base URL
+            parsed = urlparse(resp.url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            post_url = action if action.startswith("http") else f"{base_url}{action}"
+            logger.info("提交 SAML 回调表单到: %s", post_url)
+            try:
+                resp = session.post(post_url, data=inputs, timeout=30, allow_redirects=True)
+                if resp.status_code != 200:
+                    logger.warning("SAML 回调表单提交失败: HTTP %d, URL: %s", resp.status_code, resp.url)
+                    return None
+                logger.info("SAML 回调完成，最终页面: %s", resp.url)
+            except requests.RequestException as e:
+                logger.error("SAML 回调表单提交异常: %s", e)
+                return None
+        else:
+            logger.warning("SAML 回调页未找到 POST 表单")
+
     soup = BeautifulSoup(resp.text, "html.parser")
 
     # 收集所有 <a> 链接
