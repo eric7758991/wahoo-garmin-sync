@@ -483,12 +483,15 @@ def login_wahoo(session: requests.Session) -> bool:
     raw_action = form.get("action", "/saml/auth")
     # 去掉 ?xxx 部分，保留纯路径
     action_path = raw_action.split("?")[0]
+    # 使用 GET 请求最终 URL（含重定向后的实际域名）作为 base
+    parsed_base = urlparse(resp.url)
+    actual_base_url = f"{parsed_base.scheme}://{parsed_base.netloc}"
     if action_path.startswith("/"):
-        post_url = f"{WAHOO_BASE_URL}{action_path}"
+        post_url = f"{actual_base_url}{action_path}"
     elif action_path.startswith("http"):
         post_url = action_path
     else:
-        post_url = f"{WAHOO_BASE_URL}/{action_path}"
+        post_url = f"{actual_base_url}/{action_path}"
 
     logger.info("登录表单 POST 到: %s", post_url)
     logger.info("表单隐藏字段: %s", list(form_inputs.keys()))
@@ -503,8 +506,8 @@ def login_wahoo(session: requests.Session) -> bool:
     form_data["password"] = WAHOO_PASSWORD
 
     headers = {
-        "Referer": f"{WAHOO_BASE_URL}/login",
-        "Origin": WAHOO_BASE_URL,
+        "Referer": f"{actual_base_url}/login",
+        "Origin": actual_base_url,
         "Content-Type": "application/x-www-form-urlencoded",
     }
 
